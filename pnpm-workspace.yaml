@@ -1,0 +1,21 @@
+packages:
+  - apps/*
+  - packages/*
+allowBuilds:
+  '@prisma/engines': true
+  '@scarf/scarf': true
+  esbuild: true
+  msgpackr-extract: true
+  prisma: true
+onlyBuiltDependencies:
+  - "@prisma/engines"
+  - prisma
+  - esbuild
+  - sharp
+  - "@nestjs/core"
+overrides:
+  acorn: 8.18.0
+  postcss: 8.5.28
+  nanoid: 3.3.19
+  nanostores: 1.5.4
+  exsolve: 1.1.1
