@@ -1,0 +1,182 @@
+# Production/demo stack for this VM's Traefik+Cloudflare setup.
+# Run with: docker compose -f compose.prod.yaml --env-file .env.prod up -d --build
+# .env.prod is local-only (gitignored); copy it from .env.prod.example first.
+name: gerez-prod
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: gerez-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gerez}
+      POSTGRES_USER: ${POSTGRES_USER:-gerez}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: ["gerez_prod_postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gerez} -d ${POSTGRES_DB:-gerez}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: gerez-redis
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["gerez_prod_redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    build:
+      context: ./ops/minio
+      target: server
+    container_name: gerez-minio
+    restart: always
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gerez-storage}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes: ["gerez_prod_minio_data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # Only products/* objects are anonymously readable (ops/minio/public-images-policy.json).
+    # Published so Traefik (on another host) can route cdn.gerez.pt here.
+    ports: ["8093:9000"]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gerez-cdn-router.rule=Host(`cdn.gerez.pt`)"
+      - "traefik.http.routers.gerez-cdn-router.entrypoints=web"
+      - "traefik.http.routers.gerez-cdn-router.service=gerez-cdn-svc"
+      - "traefik.http.services.gerez-cdn-svc.loadbalancer.server.port=9000"
+
+  minio-init:
+    build:
+      context: ./ops/minio
+      target: client
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gerez-storage}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-gerez-images}
+    entrypoint: ["/bin/sh", "/init.sh"]
+    volumes:
+      - ./ops/minio/init.sh:/init.sh:ro
+      - ./ops/minio/public-images-policy.json:/public-images-policy.json:ro
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: gerez-api
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gerez}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gerez}
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      BETTER_AUTH_URL: https://gerez.pt
+      SHOP_ORIGIN: https://gerez.pt
+      ADMIN_ORIGIN: https://admin.gerez.pt
+      PROXY_SECRET: ${PROXY_SECRET}
+      BRAND_NAME: GEREZ
+      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@gerez.pt}
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      EMAIL_FROM: ${EMAIL_FROM:-GEREZ <onboarding@resend.dev>}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      STRIPE_PAYMENT_METHOD_CONFIGURATION: ${STRIPE_PAYMENT_METHOD_CONFIGURATION}
+      SHIPPING_COUNTRIES: ${SHIPPING_COUNTRIES}
+      SHIPPING_PRICE_MINOR: ${SHIPPING_PRICE_MINOR:-0}
+      TAX_POLICY: ${TAX_POLICY}
+      TAX_RATES_JSON: ${TAX_RATES_JSON:-{}}
+      # Public HTTPS endpoint (round-trips through Traefik/Cloudflare to the
+      # minio container) because production requires an HTTPS storage URL.
+      STORAGE_ENDPOINT: https://cdn.gerez.pt
+      STORAGE_REGION: us-east-1
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-gerez-images}
+      STORAGE_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-gerez-storage}
+      STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      STORAGE_CDN_URL: https://cdn.gerez.pt/${STORAGE_BUCKET:-gerez-images}
+    # Internal only: never published to the host/Traefik.
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_BRAND_NAME: GEREZ
+        NEXT_PUBLIC_SHOP_ORIGIN: https://gerez.pt
+        NEXT_PUBLIC_CDN_URL: https://cdn.gerez.pt/${STORAGE_BUCKET:-gerez-images}
+    container_name: gerez-web
+    restart: always
+    depends_on: [api]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      API_INTERNAL_URL: http://api:4000
+      SHOP_ORIGIN: https://gerez.pt
+      ADMIN_ORIGIN: https://admin.gerez.pt
+      PROXY_SECRET: ${PROXY_SECRET}
+      NEXT_PUBLIC_BRAND_NAME: GEREZ
+      NEXT_PUBLIC_SHOP_ORIGIN: https://gerez.pt
+      NEXT_PUBLIC_CDN_URL: https://cdn.gerez.pt/${STORAGE_BUCKET:-gerez-images}
+    ports: ["8091:3000"]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gerez-router.rule=Host(`gerez.pt`)"
+      - "traefik.http.routers.gerez-router.entrypoints=web"
+      - "traefik.http.routers.gerez-router.service=gerez-svc"
+      - "traefik.http.services.gerez-svc.loadbalancer.server.port=3000"
+
+  admin:
+    build:
+      context: .
+      dockerfile: apps/admin/Dockerfile
+      args:
+        NEXT_PUBLIC_BRAND_NAME: GEREZ
+        NEXT_PUBLIC_SHOP_ORIGIN: https://gerez.pt
+        NEXT_PUBLIC_CDN_URL: https://cdn.gerez.pt/${STORAGE_BUCKET:-gerez-images}
+    container_name: gerez-admin
+    restart: always
+    depends_on: [api]
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      API_INTERNAL_URL: http://api:4000
+      SHOP_ORIGIN: https://gerez.pt
+      ADMIN_ORIGIN: https://admin.gerez.pt
+      PROXY_SECRET: ${PROXY_SECRET}
+      NEXT_PUBLIC_BRAND_NAME: GEREZ
+      NEXT_PUBLIC_SHOP_ORIGIN: https://gerez.pt
+      NEXT_PUBLIC_CDN_URL: https://cdn.gerez.pt/${STORAGE_BUCKET:-gerez-images}
+    ports: ["8092:3001"]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gerez-admin-router.rule=Host(`admin.gerez.pt`)"
+      - "traefik.http.routers.gerez-admin-router.entrypoints=web"
+      - "traefik.http.routers.gerez-admin-router.service=gerez-admin-svc"
+      - "traefik.http.services.gerez-admin-svc.loadbalancer.server.port=3001"
+
+volumes:
+  gerez_prod_postgres_data:
+  gerez_prod_redis_data:
+  gerez_prod_minio_data:
